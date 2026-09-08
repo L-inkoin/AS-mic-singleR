@@ -121,21 +121,19 @@ calc_stats_and_filter <- function(df, dataset_name) {
     p_8w_vs_wt  <- tryCatch(t.test(vec_hf8, vec_wt8)$p.value, error = function(e) NA_real_)
     p_21w_vs_8w <- tryCatch(t.test(vec_hf21, vec_hf8)$p.value, error = function(e) NA_real_)
     
-    # 趋势判定: 上升 (FC > 1) 或 下降 (FC < 1)
     trend_1 <- if (fc_8w_vs_wt > 1) "Up" else "Down"
     trend_2 <- if (fc_21w_vs_8w > 1) "Up" else "Down"
     
-    # 筛选规则 1 (最宽松): 两组比较中均呈现下降趋势
+
     pass_level1 <- (trend_1 == "Down" && trend_2 == "Down")
     
-    # 筛选规则 2 (较严): 均为下降趋势，且后期的 FC 比前期更小（下降幅度进一步加剧）
+
     pass_level2 <- FALSE
     if (pass_level1) {
-      # 下降趋势：21周的 FC 小于 8周的 FC (例如 0.3 < 0.6)
+      
       pass_level2 <- (fc_21w_vs_8w < fc_8w_vs_wt)
     }
     
-    # 筛选规则 3 (最严): 满足 level2 且 至少在一组比较中有显著差异 (P < 0.05)
     pass_level3 <- pass_level2 && (
       (!is.na(p_8w_vs_wt) && p_8w_vs_wt < 0.05) || 
         (!is.na(p_21w_vs_8w) && p_21w_vs_8w < 0.05)
