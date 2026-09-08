@@ -1,0 +1,341 @@
+library(readr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(purrr)
+library(ggplot2)
+
+if (requireNamespace("showtext", quietly = TRUE)) {
+  library(showtext)
+  showtext_auto()
+}
+
+
+output_dir <- "multiomics_full_analysis_output_2"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+raw_protein_file <- "protein.csv"
+raw_blood_file   <- "metabolism_blood_fl.csv"
+raw_fecal_file   <- "metabolism_fecal_fl.csv"
+
+
+#更改绘图分级记得改文件名
+#chosen_level <- "Level1_Loose" 
+chosen_level <- "Level2_Strict"
+#chosen_level <- "Level3_Strict_SigP"
+
+
+expected_groups <- list(
+  hf_21w = paste0("TG_A_", 1:7), 
+  hf_8w  = paste0("TG_B_", 1:8), 
+  wt_8w  = paste0("WT", 1:8)      
+)
+
+group_labels <- c(
+  hf_21w = "21周高脂",
+  hf_8w  = "8周高脂",
+  wt_8w  = "8周正常"
+)
+
+
+clean_column_names <- function(df) {
+  colnames(df) <- str_replace_all(colnames(df), "^\\ufeff", "")
+  colnames(df) <- str_trim(colnames(df))
+  return(df)
+}
+
+load_and_prep_raw <- function(file_path, type_label) {
+  if (!file.exists(file_path)) stop("找不到文件: ", file_path)
+  
+  df <- read_csv(file_path, show_col_types = FALSE) %>% clean_column_names()
+  
+  if (type_label == "protein") {
+    df <- df %>% mutate(
+      feature_id   = as.character(Protein),
+      feature_name = ifelse(!is.na(Gene) & Gene != "", as.character(Gene), as.character(Protein))
+    )
+  } else {
+    df <- df %>% mutate(
+      feature_id   = as.character(Compound_ID),
+      feature_name = as.character(Name)
+    )
+  }
+  
+  return(df)
+}
+
+
+prep_numeric_matrix <- function(df) {
+  all_samples <- unlist(expected_groups)
+  present_samples <- intersect(all_samples, colnames(df))
+  
+  for (col in present_samples) {
+    df[[col]] <- suppressWarnings(as.numeric(df[[col]]))
+  }
+  return(df)
+}
+
+
+protein_raw <- load_and_prep_raw(raw_protein_file, "protein") %>% prep_numeric_matrix()
+blood_raw   <- load_and_prep_raw(raw_blood_file, "blood_metabolite") %>% prep_numeric_matrix()
+fecal_raw   <- load_and_prep_raw(raw_fecal_file, "fecal_metabolite") %>% prep_numeric_matrix()
+
+common_metabolite_ids <- intersect(blood_raw$feature_id, fecal_raw$feature_id)
+
+blood_filtered_step1 <- blood_raw %>% filter(feature_id %in% common_metabolite_ids)
+fecal_filtered_step1 <- fecal_raw %>% filter(feature_id %in% common_metabolite_ids)
+
+message(nrow(blood_filtered_step1))
+message(nrow(fecal_filtered_step1))
+
+
+
+calc_stats_and_filter <- function(df, dataset_name) {
+  
+  samples_wt8  <- intersect(expected_groups$wt_8w, colnames(df))
+  samples_hf8  <- intersect(expected_groups$hf_8w, colnames(df))
+  samples_hf21 <- intersect(expected_groups$hf_21w, colnames(df))
+  
+  res_list <- vector("list", nrow(df))
+  
+  for (i in seq_len(nrow(df))) {
+    row <- df[i, ]
+    f_id   <- row$feature_id
+    f_name <- row$feature_name
+    
+    vec_wt8  <- as.numeric(row[samples_wt8])[is.finite(as.numeric(row[samples_wt8]))]
+    vec_hf8  <- as.numeric(row[samples_hf8])[is.finite(as.numeric(row[samples_hf8]))]
+    vec_hf21 <- as.numeric(row[samples_hf21])[is.finite(as.numeric(row[samples_hf21]))]
+    
+    if (length(vec_wt8) < 2 || length(vec_hf8) < 2 || length(vec_hf21) < 2) next
+    
+    m_wt8  <- mean(vec_wt8)
+    m_hf8  <- mean(vec_hf8)
+    m_hf21 <- mean(vec_hf21)
+    
+    denom1 <- if (m_wt8 == 0) 1e-6 else m_wt8
+    denom2 <- if (m_hf8 == 0) 1e-6 else m_hf8
+    
+    fc_8w_vs_wt  <- m_hf8 / denom1
+    fc_21w_vs_8w <- m_hf21 / denom2
+    
+    p_8w_vs_wt  <- tryCatch(t.test(vec_hf8, vec_wt8)$p.value, error = function(e) NA_real_)
+    p_21w_vs_8w <- tryCatch(t.test(vec_hf21, vec_hf8)$p.value, error = function(e) NA_real_)
+    
+    # 趋势判定: 上升 (FC > 1) 或 下降 (FC < 1)
+    trend_1 <- if (fc_8w_vs_wt > 1) "Up" else "Down"
+    trend_2 <- if (fc_21w_vs_8w > 1) "Up" else "Down"
+    
+    # 筛选规则 1 (最宽松): 两组比较中均呈现下降趋势
+    pass_level1 <- (trend_1 == "Down" && trend_2 == "Down")
+    
+    # 筛选规则 2 (较严): 均为下降趋势，且后期的 FC 比前期更小（下降幅度进一步加剧）
+    pass_level2 <- FALSE
+    if (pass_level1) {
+      # 下降趋势：21周的 FC 小于 8周的 FC (例如 0.3 < 0.6)
+      pass_level2 <- (fc_21w_vs_8w < fc_8w_vs_wt)
+    }
+    
+    # 筛选规则 3 (最严): 满足 level2 且 至少在一组比较中有显著差异 (P < 0.05)
+    pass_level3 <- pass_level2 && (
+      (!is.na(p_8w_vs_wt) && p_8w_vs_wt < 0.05) || 
+        (!is.na(p_21w_vs_8w) && p_21w_vs_8w < 0.05)
+    )
+    
+    res_list[[i]] <- tibble(
+      feature_id = f_id,
+      feature_name = f_name,
+      mean_wt_8w = m_wt8,
+      mean_hf_8w = m_hf8,
+      mean_hf_21w = m_hf21,
+      fc_8w_vs_wt = fc_8w_vs_wt,
+      fc_21w_vs_8w = fc_21w_vs_8w,
+      p_8w_vs_wt = p_8w_vs_wt,
+      p_21w_vs_8w = p_21w_vs_8w,
+      pass_level1 = pass_level1,
+      pass_level2 = pass_level2,
+      pass_level3 = pass_level3
+    )
+  }
+  
+  bind_rows(res_list)
+}
+
+protein_stats <- calc_stats_and_filter(protein_raw, "protein")
+blood_stats   <- calc_stats_and_filter(blood_filtered_step1, "blood_metabolite")
+fecal_stats   <- calc_stats_and_filter(fecal_filtered_step1, "fecal_metabolite")
+
+# 根据 chosen_level 提取符合条件的目标 ID
+get_selected_ids <- function(stats_df, level_str) {
+  if (level_str == "Level1_Loose") {
+    stats_df %>% filter(pass_level1) %>% pull(feature_id)
+  } else if (level_str == "Level2_Strict") {
+    stats_df %>% filter(pass_level2) %>% pull(feature_id)
+  } else {
+    stats_df %>% filter(pass_level3) %>% pull(feature_id)
+  }
+}
+
+selected_protein_ids <- get_selected_ids(protein_stats, chosen_level)
+selected_blood_ids   <- get_selected_ids(blood_stats, chosen_level)
+selected_fecal_ids   <- get_selected_ids(fecal_stats, chosen_level)
+
+# 取血液与粪便在第2步筛选后的共性代谢物 ID
+selected_metabolite_ids <- intersect(selected_blood_ids, selected_fecal_ids)
+
+protein_selected <- protein_raw %>% filter(feature_id %in% selected_protein_ids)
+blood_selected   <- blood_filtered_step1 %>% filter(feature_id %in% selected_metabolite_ids)
+fecal_selected   <- fecal_filtered_step1 %>% filter(feature_id %in% selected_metabolite_ids)
+
+
+calculate_group_means <- function(df, data_type) {
+  res <- list()
+  for (g_name in names(expected_groups)) {
+    cols <- intersect(expected_groups[[g_name]], colnames(df))
+    if (length(cols) == 0) next
+    
+    tmp <- df %>%
+      select(feature_id, feature_name, all_of(cols)) %>%
+      rowwise() %>%
+      mutate(
+        mean_value   = mean(c_across(all_of(cols)), na.rm = TRUE),
+        median_value = median(c_across(all_of(cols)), na.rm = TRUE),
+        sd_value     = sd(c_across(all_of(cols)), na.rm = TRUE),
+        n_detected   = sum(is.finite(c_across(all_of(cols))))
+      ) %>%
+      ungroup() %>%
+      mutate(
+        data_type = data_type,
+        group = g_name,
+        group_label = unname(group_labels[g_name]),
+        n_samples = length(cols)
+      ) %>%
+      select(data_type, feature_id, feature_name, group, group_label, n_samples, n_detected, mean_value, median_value, sd_value)
+    res[[g_name]] <- tmp
+  }
+  bind_rows(res)
+}
+
+all_means_long <- bind_rows(
+  calculate_group_means(protein_selected, "protein"),
+  calculate_group_means(blood_selected, "blood_metabolite"),
+  calculate_group_means(fecal_selected, "fecal_metabolite")
+)
+
+if (nrow(all_means_long) > 0) {
+  all_means_wide <- all_means_long %>%
+    select(data_type, feature_id, feature_name, group_label, mean_value, median_value, sd_value) %>%
+    pivot_wider(
+      id_cols = c(data_type, feature_id, feature_name),
+      names_from = group_label,
+      values_from = c(mean_value, median_value, sd_value),
+      names_glue = "{.value}_{group_label}"
+    )
+  
+  write_csv(all_means_wide, file.path(output_dir, "target_features_three_groups_mean_distribution.csv"))
+}
+
+
+make_boxplot_pdf <- function(df, data_type_name) {
+  if (nrow(df) == 0) return(NULL)
+  
+  all_samples <- unlist(expected_groups)
+  present_cols <- intersect(all_samples, colnames(df))
+  
+  plot_data <- df %>%
+    select(feature_id, feature_name, all_of(present_cols)) %>%
+    pivot_longer(cols = all_of(present_cols), names_to = "sample", values_to = "value") %>%
+    mutate(
+      group = case_when(
+        sample %in% expected_groups$hf_21w ~ "21周高脂",
+        sample %in% expected_groups$hf_8w  ~ "8周高脂",
+        sample %in% expected_groups$wt_8w  ~ "8周正常",
+        TRUE ~ NA_character_
+      )
+    ) %>%
+    filter(!is.na(group), is.finite(value)) %>%
+    mutate(group = factor(group, levels = c("8周正常", "8周高脂", "21周高脂")))
+  
+  feature_ids <- unique(plot_data$feature_id)
+  page_ids <- split(feature_ids, ceiling(seq_along(feature_ids) / 12))
+  
+  pdf_path <- file.path(output_dir, paste0(data_type_name, "_distribution_boxplots.pdf"))
+  pdf(pdf_path, width = 14, height = 10, onefile = TRUE)
+  
+  for (p_features in page_ids) {
+    p_df <- plot_data %>%
+      filter(feature_id %in% p_features) %>%
+      mutate(feature_label = paste0(feature_name, "\n(", feature_id, ")"))
+    
+    p <- ggplot(p_df, aes(x = group, y = value, fill = group)) +
+      geom_boxplot(width = 0.6, outlier.shape = NA, alpha = 0.75) +
+      geom_jitter(width = 0.1, size = 0.8, alpha = 0.7) +
+      facet_wrap(~ feature_label, scales = "free_y", ncol = 3) +
+      scale_fill_manual(values = c("8周正常" = "#4DBBD5", "8周高脂" = "#E64B35", "21周高脂" = "#3C5488")) +
+      labs(title = paste(data_type_name, "分组表达/定量分布"), x = NULL, y = "定量值") +
+      theme_bw(base_size = 11) +
+      theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+    
+    print(p)
+  }
+  dev.off()
+  return(pdf_path)
+}
+
+make_boxplot_pdf(protein_selected, "protein")
+make_boxplot_pdf(blood_selected, "blood_metabolite")
+make_boxplot_pdf(fecal_selected, "fecal_metabolite")
+
+
+# Pearson 
+
+calculate_pearson_pairs <- function(protein_df, met_df, met_type_label) {
+  
+  all_samples <- unlist(expected_groups)
+  common_samples <- intersect(intersect(colnames(protein_df), colnames(met_df)), all_samples)
+  
+  if (length(common_samples) < 5) {
+    warning("共有样本不足 5 个，跳过 ", met_type_label, " 相关性计算。")
+    return(tibble(protein = character(), metabolite = character(), correlation_R = numeric(), P_value = numeric()))
+  }
+  
+  results <- list()
+  idx <- 1
+  
+  for (i in seq_len(nrow(protein_df))) {
+    p_row  <- protein_df[i, ]
+    p_name <- paste0(p_row$feature_name, " (", p_row$feature_id, ")")
+    p_vec  <- as.numeric(p_row[common_samples])
+    
+    for (j in seq_len(nrow(met_df))) {
+      m_row  <- met_df[j, ]
+      m_name <- paste0(m_row$feature_name, " (", m_row$feature_id, ")")
+      m_vec  <- as.numeric(m_row[common_samples])
+      
+      valid <- is.finite(p_vec) & is.finite(m_vec)
+      if (sum(valid) >= 5) {
+        test_res <- tryCatch(cor.test(p_vec[valid], m_vec[valid], method = "pearson"), error = function(e) NULL)
+        
+        if (!is.null(test_res)) {
+          results[[idx]] <- tibble(
+            protein       = p_name,
+            metabolite    = m_name,
+            correlation_R = unname(test_res$estimate),
+            P_value       = test_res$p.value
+          )
+          idx <- idx + 1
+        }
+      }
+    }
+  }
+  
+  res_df <- bind_rows(results)
+  if (nrow(res_df) > 0) res_df <- res_df %>% arrange(P_value)
+  return(res_df)
+}
+
+protein_blood_pearson <- calculate_pearson_pairs(protein_selected, blood_selected, "blood_metabolite")
+protein_fecal_pearson <- calculate_pearson_pairs(protein_selected, fecal_selected, "fecal_metabolite")
+
+write_csv(protein_blood_pearson, file.path(output_dir, "protein_blood_metabolite_pearson_correlation.csv"))
+write_csv(protein_fecal_pearson, file.path(output_dir, "protein_fecal_metabolite_pearson_correlation.csv"))
+
